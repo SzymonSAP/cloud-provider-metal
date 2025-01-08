@@ -8,9 +8,11 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"path"
+	"sync"
 
+	"github.com/fsnotify/fsnotify"
 	metalv1alpha1 "github.com/ironcore-dev/metal-operator/api/v1alpha1"
-	"github.com/pkg/errors"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
@@ -32,26 +34,20 @@ func init() {
 	utilruntime.Must(metalv1alpha1.AddToScheme(metalScheme))
 
 	cloudprovider.RegisterCloudProvider(ProviderName, func(config io.Reader) (cloudprovider.Interface, error) {
-		cfg, err := LoadCloudProviderConfig(config)
+		cloudConfig, err := LoadCloudConfig(config)
 		if err != nil {
-			return nil, errors.Wrap(err, "failed to decode config")
+			return nil, err
 		}
 
-		metalCluster, err := cluster.New(cfg.RestConfig, func(o *cluster.Options) {
-			o.Scheme = metalScheme
-			o.Cache.DefaultNamespaces = map[string]cache.Config{
-				cfg.Namespace: {},
-			}
-		})
-		if err != nil {
-			return nil, fmt.Errorf("unable to create metal cluster: %w", err)
+		c := &cloud{cloudConfig: *cloudConfig}
+		if err := c.setMetalClusterWhenConfigIsChanged(); err != nil {
+			return nil, err
+		}
+		if err := c.setMetalCluster(); err != nil {
+			return nil, err
 		}
 
-		return &cloud{
-			metalCluster:   metalCluster,
-			metalNamespace: cfg.Namespace,
-			cloudConfig:    cfg.cloudConfig,
-		}, nil
+		return c, nil
 	})
 }
 
@@ -61,6 +57,63 @@ type cloud struct {
 	metalNamespace string
 	cloudConfig    CloudConfig
 	instancesV2    cloudprovider.InstancesV2
+	mu             sync.Mutex
+}
+
+func (c *cloud) setMetalCluster() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	cfg, err := LoadCloudProviderConfig()
+	if err != nil {
+		return fmt.Errorf("failed to decode config: %w", err)
+	}
+
+	metalCluster, err := cluster.New(cfg.RestConfig, func(o *cluster.Options) {
+		o.Scheme = metalScheme
+		o.Cache.DefaultNamespaces = map[string]cache.Config{
+			cfg.Namespace: {},
+		}
+	})
+	if err != nil {
+		return fmt.Errorf("unable to create metal cluster: %w", err)
+	}
+
+	c.metalCluster = metalCluster
+	c.metalNamespace = cfg.Namespace
+
+	return nil
+}
+
+func (c *cloud) setMetalClusterWhenConfigIsChanged() error {
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		return fmt.Errorf("unable to create kubeconfig watcher: %w", err)
+	}
+
+	err = watcher.Add(path.Dir(MetalKubeconfigPath))
+	if err != nil {
+		watcher.Close()
+		return fmt.Errorf("unable to add kubeconfig \"%s\" to watcher: %v", MetalKubeconfigPath, err)
+	}
+
+	go func() {
+		defer watcher.Close()
+		for {
+			select {
+			case err := <-watcher.Errors:
+				log.Fatalf("watcher returned an error: %v", err)
+			case event := <-watcher.Events:
+				if event.Name != MetalKubeconfigPath {
+					continue
+				}
+				if err := c.setMetalCluster(); err != nil {
+					log.Fatalf("couldn't update cloud struct when config has changed %v", err)
+				}
+			}
+		}
+	}()
+	return nil
 }
 
 func (o *cloud) Initialize(clientBuilder cloudprovider.ControllerClientBuilder, stop <-chan struct{}) {
@@ -80,6 +133,8 @@ func (o *cloud) Initialize(clientBuilder cloudprovider.ControllerClientBuilder, 
 		log.Fatalf("Failed to create new cluster: %v", err)
 	}
 
+	o.mu.Lock()
+	defer o.mu.Unlock()
 	o.instancesV2 = newMetalInstancesV2(
 		o.targetCluster.GetClient(),
 		o.metalCluster.GetClient(),
@@ -99,7 +154,10 @@ func (o *cloud) Initialize(clientBuilder cloudprovider.ControllerClientBuilder, 
 	}
 	// TODO: setup informer for Services
 
+	wg := sync.WaitGroup{}
+	wg.Add(1)
 	go func() {
+		defer wg.Done()
 		if err := o.metalCluster.Start(ctx); err != nil {
 			log.Fatalf("Failed to start metal cluster: %v", err)
 		}
@@ -118,6 +176,7 @@ func (o *cloud) Initialize(clientBuilder cloudprovider.ControllerClientBuilder, 
 		log.Fatal("Failed to wait for target cluster cache to sync")
 	}
 	klog.V(2).Infof("Successfully initialized cloud provider: %s", ProviderName)
+	wg.Wait()
 }
 
 func (o *cloud) LoadBalancer() (cloudprovider.LoadBalancer, bool) {

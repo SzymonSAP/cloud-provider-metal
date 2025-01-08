@@ -17,9 +17,8 @@ import (
 )
 
 type CloudProviderConfig struct {
-	RestConfig  *rest.Config
-	Namespace   string
-	cloudConfig CloudConfig
+	RestConfig *rest.Config
+	Namespace  string
 }
 
 type Networking struct {
@@ -39,7 +38,7 @@ func AddExtraFlags(fs *pflag.FlagSet) {
 	fs.StringVar(&MetalKubeconfigPath, "metal-kubeconfig", "", "Path to the metal cluster kubeconfig.")
 }
 
-func LoadCloudProviderConfig(f io.Reader) (*CloudProviderConfig, error) {
+func LoadCloudConfig(f io.Reader) (*CloudConfig, error) {
 	klog.V(2).Infof("Reading configuration for cloud provider: %s", ProviderName)
 	configBytes, err := io.ReadAll(f)
 	if err != nil {
@@ -55,6 +54,10 @@ func LoadCloudProviderConfig(f io.Reader) (*CloudProviderConfig, error) {
 		return nil, fmt.Errorf("clusterName missing in cloud config")
 	}
 
+	return cloudConfig, nil
+}
+
+func LoadCloudProviderConfig() (*CloudProviderConfig, error) {
 	kubeconfigData, err := os.ReadFile(MetalKubeconfigPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read metal kubeconfig %s: %w", MetalKubeconfigPath, err)
@@ -81,8 +84,7 @@ func LoadCloudProviderConfig(f io.Reader) (*CloudProviderConfig, error) {
 	klog.V(2).Infof("Successfully read configuration for cloud provider: %s", ProviderName)
 
 	return &CloudProviderConfig{
-		RestConfig:  restConfig,
-		Namespace:   namespace,
-		cloudConfig: *cloudConfig,
+		RestConfig: restConfig,
+		Namespace:  namespace,
 	}, nil
 }
